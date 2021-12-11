@@ -19,7 +19,7 @@ wgsl! {
 
     [[block]]
     struct Uniforms {
-        simulation_speed: f32; 
+        simulation_speed: f32;
     };
 
     [[group(0), binding(1)]]
@@ -35,7 +35,7 @@ wgsl! {
 
 fn main() {
     let mut particles: Buffer<Particles> = Buffer::new();
-    let mut uniforms = Buffer::<Uniforms>::new(); 
+    let mut uniforms = Buffer::<Uniforms>::new();
 
     uniforms.simulation_speed = 0.0;
 
@@ -59,8 +59,6 @@ fn main() {
 
     uniforms.simulation_speed = 2.0;
 
-    let t = Instant::now();
-
     let bindings = comp::Bindings {
         particles: &mut particles,
         uniforms: &uniforms,
@@ -69,11 +67,5 @@ fn main() {
     comp::build(bindings)
         .dispatch_multiple(&[Dispatch::new(1_000_000 / comp::WORK_GROUP_SIZE.x, 1, 1); 100]);
 
-    println!("{:?}", Instant::now() - t);
-
-    let t = Instant::now();
-
     println!("{:?}", &particles.particles[0]);
-
-    println!("{:?}", Instant::now() - t);
 }

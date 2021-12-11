@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use proc_macro2::{Delimiter, TokenTree};
+use proc_macro2::{Delimiter, Spacing, TokenTree};
 use proc_macro_error::{Diagnostic, Level};
 
 pub trait WgslResult {
@@ -20,7 +20,7 @@ impl<T> WgslResult for Result<T, naga::front::wgsl::ParseError> {
 
                 let span = wgsl.get_span(column);
 
-                Diagnostic::spanned(*span, Level::Error, format!("{}", error)).abort()
+                Diagnostic::spanned(*span, Level::Error, error.to_string()).abort()
             }
         }
     }
@@ -39,7 +39,7 @@ impl Wgsl {
         }
 
         for (span_start, span) in self.spans.iter().rev() {
-            if start > *span_start {
+            if start >= *span_start {
                 return span;
             }
         }
@@ -103,7 +103,11 @@ impl Wgsl {
             }
             TokenTree::Punct(punct) => {
                 self.add_string(&punct.to_string(), punct.span());
-                self.source.push(' ');
+
+                match punct.spacing() {
+                    Spacing::Alone => self.source.push(' '),
+                    Spacing::Joint => {}
+                }
             }
         }
     }

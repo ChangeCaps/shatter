@@ -80,7 +80,7 @@ impl<'a, S: ComputeShader<'a>> ComputeShaderBuilder<'a, S> {
 
     #[inline]
     pub fn dispatch_multiple(&mut self, dispatches: &[Dispatch]) -> &mut Self {
-        self.bindings.upload();
+        self.bindings.read();
 
         let instance = Instance::global();
 
@@ -153,7 +153,7 @@ impl<'a, S: ComputeShader<'a>> ComputeShaderBuilder<'a, S> {
 
             instance.queue.submit(std::iter::once(encoder.finish()));
 
-            self.bindings.download();
+            self.bindings.write();
         };
 
         self

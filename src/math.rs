@@ -39,3 +39,23 @@ impl<T> Vec4<T> {
         Self { x, y, z, w }
     }
 }
+
+macro_rules! impl_vec {
+    ($ty:ty, zero: $zero:expr) => {
+        impl Vec2<$ty> {
+            pub const ZERO: Self = Self::new($zero, $zero);
+        }
+
+        impl Vec3<$ty> {
+            pub const ZERO: Self = Self::new($zero, $zero, $zero);
+        }
+
+        impl Vec4<$ty> {
+            pub const ZERO: Self = Self::new($zero, $zero, $zero, $zero);
+        }
+    };
+}
+
+impl_vec!(f32, zero: 0.0);
+impl_vec!(i32, zero: 0);
+impl_vec!(u32, zero: 0);

@@ -18,7 +18,6 @@ pub type BindGroupId = Id<wgpu::BindGroup>;
 pub type BufferId = Id<wgpu::Buffer>;
 pub type SamplerId = Id<wgpu::Sampler>;
 pub type TextureId = Id<wgpu::Texture>;
-pub type TextureViewId = Id<wgpu::TextureView>;
 pub type PipelineLayoutDescriptorId = Id<crate::PipelineLayoutDescriptor>;
 pub type PipelineLayoutId = Id<wgpu::PipelineLayout>;
 pub type ComputePipelineDescriptorId = Id<crate::ComputePipelineDescriptor>;
@@ -28,6 +27,11 @@ pub type RenderPipelineId = Id<wgpu::RenderPipeline>;
 pub struct Id<T>(u64, Arc<AtomicU32>, PhantomData<fn() -> T>);
 
 impl<T> Id<T> {
+    #[allow(dead_code)]
+    pub(crate) fn zero() -> Self {
+        Self(0, Arc::new(Default::default()), PhantomData)
+    }
+
     pub(crate) fn ref_count(&self) -> u32 {
         self.1.load(Ordering::Acquire)
     }

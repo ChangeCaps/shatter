@@ -3,18 +3,60 @@ use std::collections::HashMap;
 use crate::wgsl::{Wgsl, WgslResult};
 use naga::{
     proc::TypeResolution,
-    valid::{Capabilities, FunctionInfo, GlobalUse, ModuleInfo, ValidationFlags, Validator},
-    ArraySize, Constant, ConstantInner, Handle, Module, ScalarKind, ScalarValue, StorageAccess,
-    StorageClass, Type, TypeInner, VectorSize,
+    valid::{
+        Capabilities, ExpressionError, FunctionError, FunctionInfo, GlobalUse, ModuleInfo,
+        ValidationError, ValidationFlags, Validator,
+    },
+    ArraySize, Constant, ConstantInner, EntryPoint, Handle, ImageClass, ImageDimension, Module,
+    ScalarKind, ScalarValue, ShaderStage, StorageAccess, StorageClass, StorageFormat, Type,
+    TypeInner, VectorSize,
 };
 use proc_macro2::{Ident, Span, TokenStream};
+use proc_macro_error::{Diagnostic, Level};
 use quote::quote;
+
+fn expression_error_span(_module: &Module, err: &ExpressionError) -> Option<naga::Span> {
+    match err {
+        _ => return None,
+    }
+}
+
+fn validation_error_span(module: &Module, err: &ValidationError) -> Option<naga::Span> {
+    Some(match err {
+        ValidationError::Layouter(ty) => module.types.get_span(ty.0),
+        &ValidationError::Type { handle, .. } => module.types.get_span(handle),
+        &ValidationError::Constant { handle, .. } => module.constants.get_span(handle),
+        &ValidationError::GlobalVariable { handle, .. } => module.global_variables.get_span(handle),
+        &ValidationError::Function {
+            handle: func,
+            ref error,
+            ..
+        } => match error {
+            &FunctionError::Expression { handle, ref error } => {
+                match expression_error_span(module, error) {
+                    Some(span) => span,
+                    None => module.functions[func].expressions.get_span(handle),
+                }
+            }
+            _ => module.functions.get_span(func),
+        },
+        _ => return None,
+    })
+}
 
 pub fn shatter(wgsl: &Wgsl) -> proc_macro::TokenStream {
     let module = naga::front::wgsl::parse_str(&wgsl.source).wgsl_unwrap(wgsl);
 
     let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
-    let info = validator.validate(&module).unwrap();
+    let info = validator.validate(&module).unwrap_or_else(|err| {
+        let span = if let Some(span) = validation_error_span(&module, &err) {
+            *wgsl.get_span(span.to_range().map_or(0, |range| range.start))
+        } else {
+            Span::call_site()
+        };
+
+        Diagnostic::spanned(span, Level::Error, format!("{}", err)).abort()
+    });
 
     let consts = gen_consts(&module);
     let types = gen_types(&module);
@@ -40,59 +82,97 @@ fn gen_entry_points(module: &Module, info: &ModuleInfo, source: &str) -> TokenSt
 
             let function_info = info.get_entry_point(i);
 
-            let bindings_ident =
-                Ident::new("Bindings", Span::call_site());
-
-            let bindings = gen_entry_point_bindings(module, &function_info, &bindings_ident);
-
-            let bindings_param = if bindings.is_some() {
-                Some(quote!(mut bindings: #ident::#bindings_ident<'a>,))
-            } else {
-                None
-            };
-
-            let work_group_size = {
-                let x = entry_point.workgroup_size[0];
-                let y = entry_point.workgroup_size[1];
-                let z = entry_point.workgroup_size[2];
-
-                quote!(::shatter::WorkGroupSize::new(
-                    #x as ::std::primitive::u32,
-                    #y as ::std::primitive::u32,
-                    #z as ::std::primitive::u32,
-                ))
-            };
-
-            quote! {
-                pub mod #ident {
-                    use super::*;
-
-                    pub const WORK_GROUP_SIZE: ::shatter::WorkGroupSize = #work_group_size;
-
-                    #bindings
-
-                    pub struct Shader;
-
-                    impl<'a> ::shatter::ComputeShader<'a> for Shader {
-                        type Bindings = #bindings_ident<'a>;
-
-                        const SOURCE: &'static ::std::primitive::str = #source;
-                        const ENTRY_POINT: &'static ::std::primitive::str = #name;
-                    }
-
-                    pub fn build<'a>(#bindings_param) -> ::shatter::ComputeShaderBuilder<'a, Shader> {
-                        ::shatter::ComputeShaderBuilder::new(bindings)
-                    }
-                }
-
-                pub fn #ident<'a>(#bindings_param dispatch: ::shatter::Dispatch) {
-                    #ident::build(bindings).dispatch(dispatch);
-                }
+            match entry_point.stage {
+                ShaderStage::Compute => gen_compute_entry_point(
+                    module,
+                    entry_point,
+                    source,
+                    name,
+                    &ident,
+                    function_info,
+                ),
+                _ => unimplemented!(),
             }
         });
 
     quote! {
         #(#entry_points)*
+    }
+}
+
+fn gen_compute_entry_point(
+    module: &Module,
+    entry_point: &EntryPoint,
+    source: &str,
+    name: &str,
+    ident: &Ident,
+    function_info: &FunctionInfo,
+) -> TokenStream {
+    let bindings_ident = Ident::new("Bindings", Span::call_site());
+
+    let bindings = gen_entry_point_bindings(module, &function_info, &bindings_ident);
+
+    let bindings_param = if bindings.is_some() {
+        Some(quote!(mut bindings: #ident::#bindings_ident<'a>,))
+    } else {
+        None
+    };
+
+    let bindings_build_var = if bindings.is_some() {
+        quote!(bindings)
+    } else {
+        quote!(())
+    };
+
+    let bindings_var = if bindings.is_some() {
+        quote!(bindings)
+    } else {
+        quote!()
+    };
+
+    let shader_bindings = if bindings.is_some() {
+        quote!(#bindings_ident<'a>)
+    } else {
+        quote!(())
+    };
+
+    let work_group_size = {
+        let x = entry_point.workgroup_size[0];
+        let y = entry_point.workgroup_size[1];
+        let z = entry_point.workgroup_size[2];
+
+        quote!(::shatter::WorkGroupSize::new(
+            #x as ::std::primitive::u32,
+            #y as ::std::primitive::u32,
+            #z as ::std::primitive::u32,
+        ))
+    };
+
+    quote! {
+        pub mod #ident {
+            use super::*;
+
+            pub const WORK_GROUP_SIZE: ::shatter::WorkGroupSize = #work_group_size;
+
+            #bindings
+
+            pub struct Shader;
+
+            impl<'a> ::shatter::ComputeShader<'a> for Shader {
+                type Bindings = #shader_bindings;
+
+                const SOURCE: &'static ::std::primitive::str = #source;
+                const ENTRY_POINT: &'static ::std::primitive::str = #name;
+            }
+
+            pub fn build<'a>(#bindings_param) -> ::shatter::ComputeShaderBuilder<'a, Shader> {
+                ::shatter::ComputeShaderBuilder::new(#bindings_build_var)
+            }
+        }
+
+        pub fn #ident<'a>(#bindings_param dispatch: ::shatter::Dispatch) {
+            #ident::build(#bindings_var).dispatch(dispatch);
+        }
     }
 }
 
@@ -104,8 +184,9 @@ fn gen_entry_point_bindings(
     let mut max_group = 0;
     let mut bind_group_layout_descriptors = HashMap::new();
     let mut bind_group_descriptors = HashMap::new();
-    let mut upload = Vec::new();
-    let mut download = Vec::new();
+    let mut prepare = Vec::new();
+    let mut read = Vec::new();
+    let mut write = Vec::new();
 
     let fields = module
         .global_variables
@@ -128,6 +209,41 @@ fn gen_entry_point_bindings(
             let ty = &module.types[variable.ty].inner;
 
             let binding_type = match ty {
+                &TypeInner::Image {
+                    ref dim,
+                    arrayed,
+                    ref class,
+                } => {
+                    let dimension = wgpu_view_dimension(dim, arrayed);
+
+                    match class {
+                        ImageClass::Storage { format, access } => {
+                            let access = match access {
+                                _ if access.contains(StorageAccess::LOAD)
+                                    && access.contains(StorageAccess::STORE) =>
+                                {
+                                    quote!(::shatter::wgpu::StorageTextureAccess::ReadWrite)
+                                }
+                                _ if access.contains(StorageAccess::LOAD) => {
+                                    quote!(::shatter::wgpu::StorageTextureAccess::ReadOnly)
+                                }
+                                _ if access.contains(StorageAccess::STORE) => {
+                                    quote!(::shatter::wgpu::StorageTextureAccess::WriteOnly)
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            let format = wgpu_texture_format(format);
+
+                            quote!(::shatter::BindingType::StorageTexture {
+                                access: #access,
+                                format: #format,
+                                view_dimension: #dimension,
+                            })
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
                 _ => {
                     let buffer_binding_type = match variable.class {
                         StorageClass::Uniform => quote!(::shatter::BufferBindingType::Uniform),
@@ -173,29 +289,29 @@ fn gen_entry_point_bindings(
 
             descriptor.insert(
                 binding.binding,
-                quote!(::shatter::BindingResource::from(&*self.#ident)),
+                quote!(::shatter::Binding::binding_resource(self.#ident)),
             );
 
             let ty = rust_type(module, variable.ty, &mut None, false);
 
-            if var_use.contains(GlobalUse::WRITE) {
-                // only download if the buffer has been written to
-                download.push(quote!(self.#ident.mark_needs_download()));
-            }
+            // prepare binding
+            prepare.push(quote!(::shatter::Binding::prepare(self.#ident)));
 
+            // only read and write as necessary
             if var_use.contains(GlobalUse::READ) {
-                // only upload if the buffer will be read
-                upload.push(quote!(self.#ident.upload()));
-            } else {
-                upload.push(quote!(self.#ident.resize_buffer()));
+                read.push(quote!(::shatter::Binding::read(self.#ident)));
             }
 
             if var_use.contains(GlobalUse::WRITE) {
-                return Some(quote!(pub #ident: &'a mut ::shatter::Buffer<#ty>));
+                write.push(quote!(::shatter::Binding::write(self.#ident)));
+            }
+
+            if var_use.contains(GlobalUse::WRITE) {
+                return Some(quote!(pub #ident: &'a mut dyn ::shatter::Binding<#ty>));
             }
 
             if var_use.contains(GlobalUse::READ) {
-                return Some(quote!(pub #ident: &'a ::shatter::Buffer<#ty>));
+                return Some(quote!(pub #ident: &'a dyn ::shatter::Binding<#ty>));
             }
 
             None
@@ -278,14 +394,6 @@ fn gen_entry_point_bindings(
 
                     ::std::vec![#(#bind_group_descriptors),*]
                 }
-
-                pub fn upload(&mut self) {
-                    #(#upload;)*
-                }
-
-                pub fn download(&mut self) {
-                    #(#download;)*
-                }
             }
 
             impl<'a> ::shatter::Bindings for #ident<'a> {
@@ -305,18 +413,51 @@ fn gen_entry_point_bindings(
                 }
 
                 #[inline]
-                fn upload(&mut self) {
-                    self.upload();
+                fn prepare(&self) {
+                    #(#prepare;)*
                 }
 
                 #[inline]
-                fn download(&mut self) {
-                    self.download();
+                fn read(&self) {
+                    #(#read;)*
+                }
+
+                #[inline]
+                fn write(&mut self) {
+                    #(#write;)*
                 }
             }
         })
     } else {
         None
+    }
+}
+
+fn wgpu_texture_format(format: &StorageFormat) -> TokenStream {
+    match format {
+        StorageFormat::Rgba8Unorm => quote!(::shatter::wgpu::TextureFormat::Rgba8Unorm),
+        _ => todo!(),
+    }
+}
+
+fn wgpu_view_dimension(dimension: &ImageDimension, arrayed: bool) -> TokenStream {
+    match dimension {
+        ImageDimension::D1 => quote!(::shatter::wgpu::TextureViewDimension::D1),
+        ImageDimension::D2 => {
+            if arrayed {
+                quote!(::shatter::wgpu::TextureViewDimension::D2Array)
+            } else {
+                quote!(::shatter::wgpu::TextureViewDimension::D2)
+            }
+        }
+        ImageDimension::D3 => quote!(::shatter::wgpu::TextureViewDimension::D3),
+        ImageDimension::Cube => {
+            if arrayed {
+                quote!(::shatter::wgpu::TextureViewDimension::CubeArray)
+            } else {
+                quote!(::shatter::wgpu::TextureViewDimension::Cube)
+            }
+        }
     }
 }
 
@@ -587,14 +728,20 @@ fn array_buffer_impl(name: &Ident, name_sized: &Ident, buffer_ty: &TokenStream) 
                 ptr: &mut ::std::ptr::NonNull<u8>,
                 (length, capacity): &mut Self::State,
             ) {
-                assert!(::std::mem::size_of::<#buffer_ty>() != 0, "capacity overflow");
+                assert!(::std::mem::size_of::<Self::Item>() != 0, "capacity overflow");
 
                 let (new_cap, new_layout) = if *capacity == 0 {
-                    (1, ::std::alloc::Layout::array::<#buffer_ty>(1).unwrap())
+                    let sized_layout = ::std::alloc::Layout::new::<#name_sized>();
+                    let array_layout = ::std::alloc::Layout::array::<Self::Item>(1).unwrap();
+                    let new_layout = sized_layout.extend(array_layout).unwrap().0.pad_to_align();
+
+                    (1, new_layout)
                 } else {
                     let new_cap = 2 * *capacity;
 
-                    let new_layout = ::std::alloc::Layout::array::<#buffer_ty>(new_cap).unwrap();
+                    let sized_layout = ::std::alloc::Layout::new::<#name_sized>();
+                    let array_layout = ::std::alloc::Layout::array::<Self::Item>(new_cap).unwrap();
+                    let new_layout = sized_layout.extend(array_layout).unwrap().0.pad_to_align();
                     (new_cap, new_layout)
                 };
 
@@ -603,10 +750,12 @@ fn array_buffer_impl(name: &Ident, name_sized: &Ident, buffer_ty: &TokenStream) 
                     "Allocation too large"
                 );
 
-                let new_ptr = if *capacity == 0 {
+                let new_ptr = if *capacity == 0 && ::std::mem::size_of::<#name_sized>() == 0 {
                     unsafe { ::std::alloc::alloc(new_layout) }
                 } else {
-                    let old_layout = ::std::alloc::Layout::array::<#buffer_ty>(*capacity).unwrap();
+                    let sized_layout = ::std::alloc::Layout::new::<#name_sized>();
+                    let array_layout = ::std::alloc::Layout::array::<Self::Item>(*capacity).unwrap();
+                    let old_layout = sized_layout.extend(array_layout).unwrap().0.pad_to_align();
                     let old_ptr = ptr.as_ptr();
                     unsafe { ::std::alloc::realloc(old_ptr, old_layout, new_layout.size()) }
                 };
@@ -745,6 +894,52 @@ fn rust_type_inner(
                         quote!([#base])
                     }
                 }
+            }
+        }
+        TypeInner::Image {
+            dim,
+            arrayed,
+            class,
+        } => {
+            let dimension = match dim {
+                ImageDimension::D1 => quote!(::shatter::texture_view_dimension::D1),
+                ImageDimension::D2 => {
+                    if arrayed {
+                        quote!(::shatter::texture_view_dimension::D2Array)
+                    } else {
+                        quote!(::shatter::texture_view_dimension::D2)
+                    }
+                }
+                ImageDimension::D3 => quote!(::shatter::texture_View_dimension::D3),
+                ImageDimension::Cube => {
+                    if arrayed {
+                        quote!(::shatter::texture_view_dimension::CubeArray)
+                    } else {
+                        quote!(::shatter::texture_view_dimension::Cube)
+                    }
+                }
+            };
+
+            match class {
+                ImageClass::Sampled { kind, multi } => {
+                    let sample_type = match kind {
+                        ScalarKind::Float => quote!(::shatter::texture_sample_type::Float<true>),
+                        ScalarKind::Sint => quote!(::shatter::texture_sample_type::Sint),
+                        ScalarKind::Uint => quote!(::shatter::texture_sample_type::Uint),
+                        ScalarKind::Bool => panic!(),
+                    };
+
+                    quote!(::shatter::TextureBinding<#sample_type, #dimension, #multi>)
+                }
+                ImageClass::Storage { format, .. } => {
+                    let texel_format = match format {
+                        StorageFormat::Rgba8Unorm => quote!(::shatter::texel_format::Rgba8Unorm),
+                        _ => unimplemented!(),
+                    };
+
+                    quote!(::shatter::StorageTextureBinding<#texel_format, #dimension>)
+                }
+                _ => unimplemented!(),
             }
         }
         _ => unimplemented!("type cannot be resolved"),

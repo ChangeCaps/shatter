@@ -3,12 +3,12 @@ use std::{
     ops::{Deref, DerefMut},
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU64, AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
 };
 
-use crate::{BufferId, Instance};
+use crate::{Binding, BindingResource, BufferBinding, BufferId, Instance};
 
 /// Allows a struct to reside inside of a [`Buffer`].
 ///
@@ -27,11 +27,11 @@ pub unsafe trait BufferData {
     unsafe fn alloc() -> NonNull<u8>;
     /// Deallocates self from a NonNull pointer.
     unsafe fn dealloc(ptr: NonNull<u8>, state: &Self::State);
-    
+
     unsafe fn as_ptr(ptr: NonNull<u8>, state: &Self::State) -> *mut Self;
 }
 
-/// Allows a struct to 
+/// Allows a struct to
 pub unsafe trait BufferVec: BufferData {
     type Item;
 
@@ -49,6 +49,28 @@ pub struct Buffer<T: BufferData + ?Sized> {
     buffer_size: AtomicU64,
     needs_download: AtomicBool,
     marker: PhantomData<T>,
+}
+
+impl<T: BufferData + ?Sized> Binding<T> for Buffer<T> {
+    fn binding_resource(&self) -> BindingResource {
+        BindingResource::Buffer(BufferBinding {
+            buffer: self.id(),
+            offset: 0,
+            size: None,
+        })
+    }
+
+    fn prepare(&self) {
+        self.resize_buffer();
+    }
+
+    fn read(&self) {
+        self.upload();
+    }
+
+    fn write(&mut self) {
+        self.mark_needs_download();
+    }
 }
 
 impl<T: BufferData + ?Sized> Default for Buffer<T> {
@@ -86,9 +108,9 @@ impl<T: BufferData + ?Sized> Buffer<T> {
         let value = unsafe { T::alloc() };
         let state = T::init();
 
-        let device = &Instance::global().device;
-
         let size = T::size(&state).max(4) as u64;
+
+        let device = &Instance::global().device;
 
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shatter_buffer"),
@@ -154,7 +176,7 @@ impl<T: BufferData + ?Sized> Buffer<T> {
     }
 
     #[inline]
-    pub fn upload(&self) { 
+    pub fn upload(&self) {
         // if we haven't downloaded, there is no need to upload
         // we know that the data hasn't changed since both reading
         // and writing requires downloading
@@ -182,12 +204,9 @@ impl<T: BufferData + ?Sized> Buffer<T> {
     #[inline]
     pub fn download(&self) {
         // if we don't need to download then don't
-        if !self.needs_download() {
+        if !self.needs_download.swap(false, Ordering::AcqRel) {
             return;
         }
-
-        // mark that we have no longer need to download
-        self.needs_download.store(false, Ordering::Release);
 
         let device = &Instance::global().device;
 
@@ -225,7 +244,7 @@ impl<T: BufferData + ?Sized> Buffer<T> {
         pollster::block_on(future).unwrap();
 
         // get a mutable slice of the data
-        let slice: &mut [u8] = &mut staging_buffer.slice(..).get_mapped_range_mut();
+        let slice: &[u8] = &staging_buffer.slice(..).get_mapped_range();
 
         assert_eq!(slice.len(), size as usize);
 
@@ -235,13 +254,13 @@ impl<T: BufferData + ?Sized> Buffer<T> {
         //   any read or write to self.value requires a download.
         //   download marks itself as not needing download.
         //   therefore it's impossible to get here while a reference
-        //   to self.value is held. 
+        //   to self.value is held.
         // * self.value doesn't overlap with slice
         // * align of u8 is 1 so pointers will always be properly aligned.
         // * we have just asserted that the length if slice is equal to size.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                slice as *mut [u8] as *mut u8,
+                slice as *const [u8] as *const u8,
                 self.value.as_ptr(),
                 size as usize,
             )
@@ -258,7 +277,7 @@ impl<T: BufferVec + ?Sized> Buffer<T> {
     #[inline]
     pub fn len(&self) -> usize {
         T::len(&self.state)
-    } 
+    }
 
     #[inline]
     pub fn push(&mut self, item: T::Item) {

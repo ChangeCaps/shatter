@@ -6,10 +6,16 @@ use wgpu::Backends;
 
 use crate::{
     BindGroupId, BindGroupLayoutId, BufferId, ComputePipelineId, IdMap, PipelineLayoutId,
-    SamplerId, ShaderModuleId, TextureViewId,
+    SamplerId, ShaderModuleId,
 };
 
 pub static GLOBAL_INSTANCE: OnceCell<Instance> = OnceCell::new();
+
+#[derive(Default)]
+pub struct InstanceDescriptor {
+    pub features: wgpu::Features,
+    pub limits: wgpu::Limits,
+}
 
 pub struct Instance {
     pub instance: wgpu::Instance,
@@ -33,10 +39,16 @@ pub struct Instance {
 
 impl Instance {
     pub fn global<'a>() -> &'a Self {
-        GLOBAL_INSTANCE.get_or_init(|| pollster::block_on(Self::initialize()).unwrap())
+        GLOBAL_INSTANCE.get_or_init(|| {
+            pollster::block_on(Self::initialize(&InstanceDescriptor::default())).unwrap()
+        })
     }
 
-    pub async fn initialize() -> anyhow::Result<Self> {
+    pub fn init(desc: &InstanceDescriptor) {
+        GLOBAL_INSTANCE.get_or_init(|| pollster::block_on(Self::initialize(desc)).unwrap());
+    }
+
+    pub async fn initialize(desc: &InstanceDescriptor) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(Backends::all());
 
         let adapter = instance
@@ -52,8 +64,8 @@ impl Instance {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("shatter_default_device"),
-                    features: wgpu::Features::default(),
-                    limits: wgpu::Limits::default(),
+                    features: desc.features,
+                    limits: desc.limits.clone(),
                 },
                 None,
             )
@@ -116,8 +128,8 @@ impl Instance {
             Buffer(Ref<'a, BufferId, wgpu::Buffer>, &'a crate::BufferBinding),
             BufferArray(Vec<(Ref<'a, BufferId, wgpu::Buffer>, &'a crate::BufferBinding)>),
             Sampler(Ref<'a, SamplerId, wgpu::Sampler>),
-            TextureView(Ref<'a, TextureViewId, wgpu::TextureView>),
-            TextureViewArray(Vec<Ref<'a, TextureViewId, wgpu::TextureView>>),
+            TextureView(wgpu::TextureView),
+            TextureViewArray(Vec<wgpu::TextureView>),
         }
 
         let resources = desc
@@ -126,6 +138,11 @@ impl Instance {
             .map(|entry| match entry.resource {
                 crate::BindingResource::Buffer(ref binding) => {
                     RefResource::Buffer(self.buffers.get(&binding.buffer).unwrap(), binding)
+                }
+                crate::BindingResource::TextureView(ref id) => {
+                    let texture = self.textures.get(id).unwrap();
+
+                    RefResource::TextureView(texture.create_view(&Default::default()))
                 }
                 _ => unimplemented!(),
             })
@@ -144,6 +161,7 @@ impl Instance {
                             size: binding.size,
                         })
                     }
+                    RefResource::TextureView(view) => wgpu::BindingResource::TextureView(view),
                     _ => unimplemented!(),
                 };
 
